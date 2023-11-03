@@ -1,6 +1,6 @@
 package freya_test
 
-import "../../freya"
+import "../../../freya"
 import "core:fmt"
 import "core:runtime"
 

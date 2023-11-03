@@ -25,3 +25,5 @@ foreign lib {
 	yield :: proc(coro: ^Freya, value: rawptr) -> rawptr ---
 	swap :: proc(from, to: ^Freya, value: rawptr) -> rawptr ---
 }
+
+_MAX_ALIGN: uint : 16
