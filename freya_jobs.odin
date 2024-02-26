@@ -371,8 +371,8 @@ scheduler_enqueue :: #force_inline proc(
 	queue_idx: uint,
 	group: ^Group,
 ) {
-	desc: []JobDescription = {
-		{
+	desc: []JobDescription =  {
+		 {
 			name = "",
 			func = func,
 			user_data = user_data,
@@ -445,13 +445,13 @@ _scheduler_init :: proc(
 	sched._queues = make([]_Queue, queue_count)
 	for i in 0 ..< queue_count {
 		sched._queues[i] = {
-			arr = make([]^Job, job_count),
-			head = 0,
-			tail = 0,
-			mask = job_count - 1,
-			parent = nil,
-			fallback = nil,
-			semaphore_count = 0,
+			arr              = make([]^Job, job_count),
+			head             = 0,
+			tail             = 0,
+			mask             = job_count - 1,
+			parent           = nil,
+			fallback         = nil,
+			semaphore_count  = 0,
 			semaphore_signal = {},
 		}
 		cursor = rawptr(uintptr(cursor) + uintptr(_jobs_align(job_count * size_of(rawptr))))
@@ -554,6 +554,7 @@ _execute_job :: #force_inline proc(sched: ^Scheduler, job: ^Job) {
 	status: JobStatus = cast(JobStatus)uintptr(resume(job.fiber, job))
 	// profile_leave(job, status)
 
+	fmt.println("Executing job with status", status)
 	switch status {
 	case .Completed:
 		{
