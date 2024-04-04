@@ -2,7 +2,7 @@ package freya
 
 import "core:fmt"
 import "core:mem"
-import "core:sync"
+// import "core:sync"
 
 // Enums
 RunMode :: enum {
@@ -11,7 +11,7 @@ RunMode :: enum {
 	Single, // Run a single non-waiting job from a queue.
 }
 
-JobStatus :: enum {
+JobStatus :: enum u32 {
 	Completed,
 	Waiting,
 	Yielding,
@@ -42,12 +42,11 @@ JobDescription :: struct {
 
 
 Scheduler :: struct {
-	_lock:        sync.Mutex,
-	_queues:      []_Queue,
-	_fibers:      []^Freya,
-	_fiber_count: uint,
-	_job_pool:    []Job,
-	_job_count:   uint,
+	_lock:        Mtx,
+	_queues:      [^]_Queue,
+	_queue_count: uint,
+	_fibers:      _Stack,
+	_job_pool:    _Stack,
 }
 
 Group :: struct {
@@ -55,17 +54,17 @@ Group :: struct {
 	_count:    uint, // Alternatively, just a dynarray or slice?
 }
 
-// _Stack :: struct {
-// 	arr:   ^rawptr,
-// 	count: uint,
-// }
+_Stack :: struct {
+	arr:   [^]rawptr,
+	count: uint,
+}
 
 _Queue :: struct {
-	arr:              []^Job,
+	arr:              [^]rawptr,
 	head, tail, mask: uint,
 	parent:           ^_Queue,
 	fallback:         ^_Queue,
-	semaphore_signal: sync.Cond,
+	semaphore_signal: Cnd,
 	semaphore_count:  uint,
 	interrupt_stamp:  uint,
 }
@@ -145,9 +144,9 @@ scheduler_init_full :: proc(
 // Destroy a scheduler. Any unfinished jobs will be lost. Flush your queues if
 // you need them to finish gracefully.
 scheduler_destroy :: proc(sched: ^Scheduler) {
-	sched._lock = {}
-	for i in 0 ..< len(sched._queues) {
-		sched._queues[i].semaphore_signal = {}
+	mtx_destroy(&sched._lock)
+	for i in 0 ..< sched._queue_count {
+		cnd_destroy(&sched._queues[i].semaphore_signal)
 	}
 }
 
@@ -182,47 +181,46 @@ scheduler_queue_priority :: proc(sched: ^Scheduler, queue_idx: uint, fallback_id
 // run.
 scheduler_run :: proc(sched: ^Scheduler, queue_idx: uint, mode: RunMode) -> bool {
 	ran := false
-	sync.mutex_lock(&sched._lock)
+	mtx_lock(&sched._lock)
 	{
 		queue := _get_queue(sched, queue_idx)
 
 		// Keep looping until the interrupt stamp is incremented
 		stamp := queue.interrupt_stamp
-		for mode != .Loop || queue.interrupt_stamp == stamp {
+		for (mode != .Loop) || (queue.interrupt_stamp == stamp) {
 			job := _queue_next_job(queue)
 			if job != nil {
 				_execute_job(sched, job)
 				ran = true
 				if mode == .Single {
 					break
-				} else if mode == .Loop {
-					// Sleep until more work is added to the queue
-					fmt.println("Loop sleep.")
-					queue.semaphore_count += 1
-					sync.cond_wait(&queue.semaphore_signal, &sched._lock)
-				} else {
-					break
 				}
+			} else if mode == .Loop {
+				// Sleep until more work is added to the queue
+				fmt.println("Loop sleep.")
+				queue.semaphore_count += 1
+				cnd_wait(&queue.semaphore_signal, &sched._lock)
+			} else {
+				break
 			}
 		}
 	}
-	sync.mutex_unlock(&sched._lock)
-	fmt.printf("Queue Idx %v ran: %v\n", queue_idx, ran)
+	mtx_unlock(&sched._lock)
 	return ran
 }
 
 // Interrupt .Loop execution of a queue on all active threads as soon as
 // their current jobs finish.
 scheduler_interrupt :: proc(sched: ^Scheduler, queue_idx: uint) {
-	sync.mutex_lock(&sched._lock)
+	mtx_lock(&sched._lock)
 	{
 		queue := _get_queue(sched, queue_idx)
 		queue.interrupt_stamp += 1
 
-		sync.cond_broadcast(&queue.semaphore_signal)
+		cnd_broadcast(&queue.semaphore_signal)
 		queue.semaphore_count = 0
 	}
-	sync.mutex_unlock(&sched._lock)
+	mtx_unlock(&sched._lock)
 }
 
 // Add jobs to the scheduler, optionally pass the address of a tina_group to
@@ -236,19 +234,20 @@ scheduler_enqueue_batch :: proc(
 	max_group_count: uint,
 ) -> uint { 	// count: uint,
 	count := uint(len(list))
-	sync.mutex_lock(&sched._lock)
+	mtx_lock(&sched._lock)
 	{
 		if group != nil {
 			count = _group_increment(group, count, max_group_count)
 		}
 
-		assert(sched._job_count >= count, "Freya Jobs Error: Ran out of jobs.")
+		assert(sched._job_pool.count >= count, "Freya Jobs Error: Ran out of jobs.")
 		for i in 0 ..< count {
 			assert(list[i].func != nil, "Freya Jobs Error: Jobs must have a body function.")
 
 			// Pop a job from the pool
-			sched._job_count -= 1
-			sched._job_pool[sched._job_count] = {
+			sched._job_pool.count -= 1
+			job := cast(^Job)sched._job_pool.arr[sched._job_pool.count]
+			job_value := Job {
 				desc           = list[i],
 				user_data      = nil,
 				fiber          = nil,
@@ -256,16 +255,17 @@ scheduler_enqueue_batch :: proc(
 				wait_next      = nil,
 				wait_threshold = 0,
 			}
+			job^ = job_value
 
 			// Push it to the proper queue
 			queue := _get_queue(sched, list[i].queue_idx)
-			queue.arr[queue.head] = &sched._job_pool[sched._job_count]
+			queue.arr[queue.head] = job
 			queue.head = (queue.head + 1) & queue.mask
 			_queue_signal(queue)
 			fmt.println("Job pushed.")
 		}
 	}
-	sync.mutex_unlock(&sched._lock)
+	mtx_unlock(&sched._lock)
 	return count
 }
 
@@ -308,7 +308,7 @@ scheduler_enqueue_n :: proc(
 // jobs. 'threshold' is useful to throttle a producer job. Allowing it to keep a
 // consumers busy without a lot of queued items.
 job_wait :: proc(job: ^Job, group: ^Group, threshold: uint) -> uint {
-	sync.mutex_lock(&job_get_scheduler(job)._lock)
+	mtx_lock(&job_get_scheduler(job)._lock)
 
 	// Check if we need to wait at all
 	count := group._count
@@ -324,7 +324,7 @@ job_wait :: proc(job: ^Job, group: ^Group, threshold: uint) -> uint {
 
 		return group._count
 	} else {
-		sync.mutex_unlock(&job_get_scheduler(job)._lock)
+		mtx_unlock(&job_get_scheduler(job)._lock)
 		return count
 	}
 }
@@ -349,18 +349,18 @@ job_switch_queue :: proc(job: ^Job, queue_idx: uint) -> uint {
 // unit of work) with multiple groups. Returns the count added which will be
 // adjusted similarly to scheduler_enqueue_batch().
 group_increment :: proc(sched: ^Scheduler, group: ^Group, count, max_count: uint) -> uint {
-	sync.mutex_lock(&sched._lock)
+	mtx_lock(&sched._lock)
 	count := _group_increment(group, count, max_count)
-	sync.mutex_unlock(&sched._lock)
+	mtx_unlock(&sched._lock)
 	return count
 }
 
 // Decrement a group's value directly to manually mark completion of some work.
 group_decrement :: proc(sched: ^Scheduler, group: ^Group, count: uint) {
-	sync.mutex_lock(&sched._lock)
+	mtx_lock(&sched._lock)
 	assert(group._count >= count, "Freya Jobs Error: Group count underflow.")
 	_group_decrement(sched, group, count)
-	sync.mutex_unlock(&sched._lock)
+	mtx_unlock(&sched._lock)
 }
 
 scheduler_enqueue :: #force_inline proc(
@@ -383,17 +383,17 @@ scheduler_enqueue :: #force_inline proc(
 	scheduler_enqueue_batch(sched, desc, group, 0)
 }
 
-_jobs_fiber :: proc(fiber: ^Freya, value: ^rawptr) -> rawptr {
+_jobs_fiber :: proc(fiber: ^Freya, value: rawptr) -> rawptr {
 	for true {
 		job: ^Job = cast(^Job)value
 		job.desc.func(job)
-		value^ = yield(fiber, rawptr(uintptr(JobStatus.Completed)))
+		value := yield(fiber, rawptr(uintptr(JobStatus.Completed)))
 	}
 	return nil
 }
 
 _jobs_align :: #force_inline proc(n: uint) -> uint {
-	return -(-n & transmute(uint)-int(_MAX_ALIGN))
+	return -(-n & transmute(uint)-transmute(int)_MAX_ALIGN)
 }
 
 _default_fiber_factory :: proc(
@@ -419,58 +419,55 @@ _scheduler_init :: proc(
 		"Freya Jobs Error: Stack size must be a power of 2.",
 	)
 
-	cursor: rawptr = buffer
+	cursor := cast([^]u8)buffer
 	sched: ^Scheduler = cast(^Scheduler)cursor
-	cursor = rawptr(uintptr(cursor) + uintptr(_jobs_align(size_of(Scheduler))))
-	sched._queues = transmute([]_Queue)mem.Raw_Slice{data = cursor, len = int(queue_count)}
-	cursor = rawptr(uintptr(cursor) + uintptr(_jobs_align(queue_count * size_of(_Queue))))
-	fibers := make([]^Freya, fiber_count)
-	sched._fibers = fibers
-	sched._fiber_count = fiber_count
-	cursor = rawptr(
-		uintptr(cursor) +
-		uintptr(_jobs_align(size_of(fibers))) +
-		uintptr(size_of(sched._fiber_count)),
-	)
-	job_pool := make([]Job, job_count)
-	sched._job_pool = job_pool
-	sched._job_count = job_count
-	cursor = rawptr(
-		uintptr(cursor) +
-		uintptr(_jobs_align(size_of(job_pool))) +
-		uintptr(size_of(sched._job_count)),
-	)
+	cursor = cursor[_jobs_align(size_of(Scheduler)):]
+	sched._queues = cast([^]_Queue)cursor
+	cursor = cursor[_jobs_align(queue_count * size_of(_Queue)):]
+	sched._fibers = {
+		arr   = cast(^rawptr)cursor,
+		count = 0,
+	}
+	cursor = cursor[_jobs_align(fiber_count * size_of(rawptr)):]
+	sched._job_pool = {
+		arr   = cast(^rawptr)cursor,
+		count = 0,
+	}
+	cursor = cursor[_jobs_align(job_count * size_of(rawptr)):]
 
 	// Initialize the queues arrays.
-	sched._queues = make([]_Queue, queue_count)
+	sched._queue_count = queue_count
 	for i in 0 ..< queue_count {
 		sched._queues[i] = {
-			arr              = make([]^Job, job_count),
-			head             = 0,
-			tail             = 0,
-			mask             = job_count - 1,
-			parent           = nil,
-			fallback         = nil,
-			semaphore_count  = 0,
-			semaphore_signal = {},
+			arr             = cast([^]rawptr)cursor,
+			head            = 0,
+			tail            = 0,
+			mask            = job_count - 1,
+			parent          = nil,
+			fallback        = nil,
+			semaphore_count = 0,
 		}
-		cursor = rawptr(uintptr(cursor) + uintptr(_jobs_align(job_count * size_of(rawptr))))
+		cnd_init(&sched._queues[i].semaphore_signal)
+		cursor = cursor[_jobs_align(job_count * size_of(rawptr)):]
 	}
 
 	// Fill the job pool
+	sched._job_pool.count = job_count
 	for i in 0 ..< job_count {
-		sched._job_pool[i] = {}
+		sched._job_pool.arr[i] = cursor
+		cursor = cursor[_jobs_align(size_of(Job)):]
 	}
+	sched._fibers.count = fiber_count
 	for i in 0 ..< fiber_count {
-		sched._fibers[i] = fiber_factory(sched, i, cursor, stack_size, factory_data)
-		cursor = rawptr(uintptr(cursor) + uintptr(stack_size))
+		sched._fibers.arr[i] = fiber_factory(sched, i, cursor, stack_size, factory_data)
+		cursor = cursor[stack_size:]
 	}
-	sched._lock = {}
+	mtx_init(&sched._lock, {.Plain})
 	return sched
 }
 
 _get_queue :: #force_inline proc(sched: ^Scheduler, queue_idx: uint) -> ^_Queue {
-	assert(queue_idx < len(sched._queues), "Freya Jobs Error: Invalid queue index.")
+	assert(queue_idx < sched._queue_count, "Freya Jobs Error: Invalid queue index.")
 
 	return &sched._queues[queue_idx]
 }
@@ -479,7 +476,7 @@ _queue_next_job :: proc(queue: ^_Queue) -> ^Job {
 	if queue.head != queue.tail {
 		result := queue.arr[queue.tail]
 		queue.tail = (queue.tail + 1) & queue.mask
-		return result
+		return cast(^Job)result
 	} else if queue.fallback != nil {
 		return _queue_next_job(queue.fallback)
 	} else {
@@ -489,7 +486,7 @@ _queue_next_job :: proc(queue: ^_Queue) -> ^Job {
 
 _queue_signal :: proc(queue: ^_Queue) {
 	if queue.semaphore_count > 0 {
-		sync.cond_signal(&queue.semaphore_signal)
+		cnd_signal(&queue.semaphore_signal)
 		queue.semaphore_count -= 1
 	} else if queue.parent != nil {
 		_queue_signal(queue.parent)
@@ -539,16 +536,16 @@ _group_decrement :: #force_inline proc(sched: ^Scheduler, group: ^Group, count: 
 }
 
 _execute_job :: #force_inline proc(sched: ^Scheduler, job: ^Job) {
-	assert(sched._fiber_count > 0, "Freya Jobs Error: Ran out of fibers.")
+	assert(sched._fibers.count > 0, "Freya Jobs Error: Ran out of fibers.")
 
 	// Assign a fiber and the thread data. (Jobs that are resuming already have a fiber)
 	if job.fiber == nil {
-		sched._fiber_count -= 1
-		job.fiber = sched._fibers[sched._fiber_count]
+		sched._fibers.count -= 1
+		job.fiber = cast(^Freya)sched._fibers.arr[sched._fibers.count]
 	}
 
 	// Unlock the scheduler while executing the job. Fibers re-lock it before yielding back
-	sync.mutex_unlock(&sched._lock)
+	mtx_unlock(&sched._lock)
 
 	// profile_enter(job)
 	status: JobStatus = cast(JobStatus)uintptr(resume(job.fiber, job))
@@ -558,12 +555,12 @@ _execute_job :: #force_inline proc(sched: ^Scheduler, job: ^Job) {
 	switch status {
 	case .Completed:
 		{
-			sync.mutex_lock(&sched._lock)
-			// REturn the components to the pools.
-			sched._job_pool[sched._job_count] = job^
-			sched._job_count += 1
-			sched._fibers[sched._fiber_count] = job.fiber
-			sched._fiber_count += 1
+			mtx_lock(&sched._lock)
+			// Return the components to the pools.
+			sched._job_pool.arr[sched._job_pool.count] = job
+			sched._job_pool.count += 1
+			sched._fibers.arr[sched._fibers.count] = job.fiber
+			sched._fibers.count += 1
 
 			// Did it have a group, and was it the last job being waited for?
 			group := job.group
@@ -573,7 +570,7 @@ _execute_job :: #force_inline proc(sched: ^Scheduler, job: ^Job) {
 		}
 	case .Yielding:
 		{
-			sync.mutex_lock(&sched._lock)
+			mtx_lock(&sched._lock)
 			// Push the job to the back of the queue.
 			queue := &sched._queues[job.desc.queue_idx]
 			queue.arr[queue.head] = job

@@ -25,30 +25,24 @@ WORKERS: [MAX_WORKERS]WorkerContext
 
 task_increment :: proc(task: ^f.Job) {
 	intrinsics.atomic_add(&COUNT, 1)
-	fmt.println("Incremented")
 }
 
 task_more_tasks :: proc(task: ^f.Job) {
 	f.scheduler_enqueue_batch(
 		SCHED,
-		[]f.JobDescription{
-			{func = task_increment},
-			{func = task_increment},
-			{func = task_increment},
-			{func = task_increment},
-			{func = task_increment},
-			{func = task_increment},
-			{func = task_increment},
-			{func = task_increment},
-			{func = task_increment},
-			{func = task_increment},
-			{func = task_increment},
-			{func = task_increment},
-			{func = task_increment},
-			{func = task_increment},
-			{func = task_increment},
-			{func = task_more_tasks},
-		},
+		{{func = task_increment}, // {func = task_increment},
+			// {func = task_increment},
+			// {func = task_increment},
+			// {func = task_increment},
+			// {func = task_increment},
+			// {func = task_increment},
+			// {func = task_increment},
+			// {func = task_increment},
+			// {func = task_increment},
+			// {func = task_increment},
+			// {func = task_increment},
+			// {func = task_increment},
+			{func = task_more_tasks}}, // {func = task_increment},// {func = task_increment},
 		nil,
 		0,
 	)
@@ -57,7 +51,7 @@ task_more_tasks :: proc(task: ^f.Job) {
 }
 
 worker_body :: proc(data: rawptr) {
-	ctx: ^WorkerContext = transmute(^WorkerContext)data
+	ctx: ^WorkerContext = cast(^WorkerContext)data
 	fmt.println("Running scheduler on thread", ctx.thread_id)
 	f.scheduler_run(ctx.sched, ctx.queue_idx, .Loop)
 }
@@ -106,5 +100,5 @@ main :: proc() {
 	f.scheduler_interrupt(SCHED, 0)
 	destroy_worker_threads()
 
-	fmt.printf("Exiting with count: %vK tasks/sec\n", COUNT / 1000 / 10)
+	fmt.printf("Exiting with count: %v tasks/sec\n", COUNT)
 }
